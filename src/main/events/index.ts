@@ -7,7 +7,7 @@ import {
   getAchievementSouvenirSyncStatus,
   retryAchievementSouvenirSync,
 } from "@main/services/achievements/grouped-souvenir-worker";
-
+import "./mods";
 import "./auth";
 import "./autoupdater";
 import "./big-picture";

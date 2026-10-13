@@ -25,6 +25,7 @@ import {
   handleClassicsLaunchError,
 } from "@renderer/helpers";
 import { DiscSelectionModal } from "../modals/disc-selection-modal";
+import { ModsModal } from "../modals/mods-modal";
 
 import "./hero-panel-actions.scss";
 import { useEffect } from "react";
@@ -65,6 +66,7 @@ export function HeroPanelActions() {
   const navigate = useNavigate();
 
   const [showDiscSelectionModal, setShowDiscSelectionModal] = useState(false);
+  const [showModsModal, setShowModsModal] = useState(false);
   const [pendingClassicsLaunch, setPendingClassicsLaunch] = useState<{
     discPath: string | undefined;
   } | null>(null);
@@ -429,6 +431,19 @@ export function HeroPanelActions() {
           <GearIcon />
           {t("options")}
         </Button>
+
+        <Button
+          onClick={() => setShowModsModal(true)}
+          theme="outline"
+          disabled={deleting}
+          className="hero-panel-actions__action"
+        >
+          Mods
+        </Button>
+        <ModsModal
+          visible={showModsModal}
+          onClose={() => setShowModsModal(false)}
+        />
 
         {game.shop === "launchbox" && (
           <DiscSelectionModal

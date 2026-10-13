@@ -1,0 +1,2195 @@
+From b5579505af9c015ec8d2854ec0501a4630b4f101 Mon Sep 17 00:00:00 2001
+From: dev <a@b>
+Date: Mon, 12 Oct 2026 23:46:21 +0000
+Subject: [PATCH] feat: Thunderstore mod manager (BepInEx/MelonLoader)
+
+---
+ src/main/events/index.ts                      |   1 +
+ src/main/events/mods/index.ts                 |  81 ++++
+ src/main/services/mods/dependencies.ts        | 137 ++++++
+ src/main/services/mods/ecosystem.ts           | 130 ++++++
+ src/main/services/mods/index.ts               |   3 +
+ src/main/services/mods/installer.ts           | 399 ++++++++++++++++++
+ src/main/services/mods/loaders.ts             | 145 +++++++
+ src/main/services/mods/mods-core.test.ts      | 161 +++++++
+ src/main/services/mods/package-index.ts       | 198 +++++++++
+ src/main/services/mods/paths.ts               |  12 +
+ src/main/services/mods/state.ts               |  54 +++
+ src/preload/index.ts                          |  54 +++
+ src/renderer/src/declaration.d.ts             |  40 ++
+ .../game-details/hero/hero-panel-actions.tsx  |  15 +
+ .../game-details/modals/mods-modal/index.ts   |   1 +
+ .../modals/mods-modal/mods-modal.scss         | 105 +++++
+ .../modals/mods-modal/mods-modal.tsx          | 366 ++++++++++++++++
+ src/types/index.ts                            |   1 +
+ src/types/mods.types.ts                       |  85 ++++
+ 19 files changed, 1988 insertions(+)
+ create mode 100644 src/main/events/mods/index.ts
+ create mode 100644 src/main/services/mods/dependencies.ts
+ create mode 100644 src/main/services/mods/ecosystem.ts
+ create mode 100644 src/main/services/mods/index.ts
+ create mode 100644 src/main/services/mods/installer.ts
+ create mode 100644 src/main/services/mods/loaders.ts
+ create mode 100644 src/main/services/mods/mods-core.test.ts
+ create mode 100644 src/main/services/mods/package-index.ts
+ create mode 100644 src/main/services/mods/paths.ts
+ create mode 100644 src/main/services/mods/state.ts
+ create mode 100644 src/renderer/src/pages/game-details/modals/mods-modal/index.ts
+ create mode 100644 src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.scss
+ create mode 100644 src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.tsx
+ create mode 100644 src/types/mods.types.ts
+
+diff --git a/src/main/events/index.ts b/src/main/events/index.ts
+index 9cbd7d0..18dbd8f 100644
+--- a/src/main/events/index.ts
++++ b/src/main/events/index.ts
+@@ -30,6 +30,7 @@ import "./user-preferences";
+ import "./library/transfer-game-files";
+ import "./emulators";
+ import "./retroarch";
++import "./mods";
+ 
+ ipcMain.handle("ping", () => "pong");
+ ipcMain.handle("getVersion", () => appVersion);
+diff --git a/src/main/events/mods/index.ts b/src/main/events/mods/index.ts
+new file mode 100644
+index 0000000..2294c6a
+--- /dev/null
++++ b/src/main/events/mods/index.ts
+@@ -0,0 +1,81 @@
++import { shell } from "electron";
++import path from "node:path";
++import { registerEvent } from "../register-event";
++import {
++  getEcosystem,
++  getGameStatus,
++  getPackageIndex,
++  installMod,
++  searchPackages,
++  setGameCommunity,
++  setModEnabled,
++  uninstallMod,
++} from "@main/services/mods";
++import { modsRoot } from "@main/services/mods/paths";
++import type { GameShop } from "@types";
++import type { ModLoaderId, ModSearchOptions } from "@types";
++
++registerEvent("modsGetStatus", (_e, shop: GameShop, objectId: string) =>
++  getGameStatus(shop, objectId)
++);
++
++registerEvent("modsListCommunities", async () => {
++  const games = await getEcosystem();
++  return games.map(({ identifier, name, packageLoader }) => ({
++    identifier,
++    name,
++    packageLoader,
++  }));
++});
++
++registerEvent(
++  "modsSetCommunity",
++  (
++    _e,
++    shop: GameShop,
++    objectId: string,
++    community: string,
++    loader?: ModLoaderId
++  ) => setGameCommunity(shop, objectId, community, loader)
++);
++
++registerEvent(
++  "modsSearch",
++  (_e, community: string, options: ModSearchOptions) =>
++    searchPackages(community, options)
++);
++
++registerEvent("modsRefreshIndex", async (_e, community: string) => {
++  await getPackageIndex(community, true);
++});
++
++registerEvent(
++  "modsInstall",
++  (_e, shop: GameShop, objectId: string, fullName: string, version?: string) =>
++    installMod(shop, objectId, fullName, version)
++);
++
++registerEvent(
++  "modsUninstall",
++  (
++    _e,
++    shop: GameShop,
++    objectId: string,
++    fullName: string,
++    removeOrphans?: boolean
++  ) => uninstallMod(shop, objectId, fullName, removeOrphans)
++);
++
++registerEvent(
++  "modsSetEnabled",
++  (_e, shop: GameShop, objectId: string, fullName: string, enabled: boolean) =>
++    setModEnabled(shop, objectId, fullName, enabled)
++);
++
++registerEvent(
++  "modsOpenFolder",
++  async (_e, shop: GameShop, objectId: string) => {
++    const status = await getGameStatus(shop, objectId);
++    await shell.openPath(status.gameDir ?? path.join(modsRoot));
++  }
++);
+diff --git a/src/main/services/mods/dependencies.ts b/src/main/services/mods/dependencies.ts
+new file mode 100644
+index 0000000..1d5e2e5
+--- /dev/null
++++ b/src/main/services/mods/dependencies.ts
+@@ -0,0 +1,137 @@
++import type { ThunderstorePackage } from "../../../types/mods.types";
++
++export interface ParsedDependency {
++  owner: string;
++  name: string;
++  version: string;
++  fullName: string;
++}
++
++/** "Owner-Name-1.2.3" -> parts. Owner has no dashes; version has none either. */
++export const parseDependency = (dep: string): ParsedDependency | null => {
++  const first = dep.indexOf("-");
++  const last = dep.lastIndexOf("-");
++  if (first <= 0 || last <= first) return null;
++  const owner = dep.slice(0, first);
++  const name = dep.slice(first + 1, last);
++  const version = dep.slice(last + 1);
++  if (!owner || !name || !/^\d+(\.\d+)*/.test(version)) return null;
++  return { owner, name, version, fullName: `${owner}-${name}` };
++};
++
++export const compareVersions = (a: string, b: string): number => {
++  const pa = a.split(/[.-]/).map((n) => parseInt(n, 10) || 0);
++  const pb = b.split(/[.-]/).map((n) => parseInt(n, 10) || 0);
++  const len = Math.max(pa.length, pb.length);
++  for (let i = 0; i < len; i++) {
++    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
++    if (diff !== 0) return diff > 0 ? 1 : -1;
++  }
++  return 0;
++};
++
++export interface PlannedInstall {
++  fullName: string;
++  version: string;
++  downloadUrl: string;
++  isDependency: boolean;
++}
++
++export interface ResolveResult {
++  /** Dependencies first, requested package last. */
++  plan: PlannedInstall[];
++  missing: string[];
++}
++
++/**
++ * Resolves what must be installed for `rootFullName`.
++ * - A dependency already installed at >= the required version is kept.
++ * - Otherwise the newest indexed version is used (always >= the required one).
++ * - Cycle-safe; unknown packages are reported in `missing`.
++ */
++export const resolveInstallPlan = (
++  rootFullName: string,
++  index: Map<string, ThunderstorePackage>,
++  installed: Record<string, { version: string }>,
++  rootVersion?: string
++): ResolveResult => {
++  const plan: PlannedInstall[] = [];
++  const missing: string[] = [];
++  const visiting = new Set<string>();
++  const done = new Set<string>();
++
++  const visit = (
++    fullName: string,
++    minVersion: string | undefined,
++    isDependency: boolean
++  ) => {
++    if (done.has(fullName) || visiting.has(fullName)) return;
++
++    const pkg = index.get(fullName);
++    if (!pkg || pkg.versions.length === 0) {
++      if (!missing.includes(fullName)) missing.push(fullName);
++      return;
++    }
++
++    const current = installed[fullName]?.version;
++    const alreadyOk =
++      isDependency &&
++      current !== undefined &&
++      (!minVersion || compareVersions(current, minVersion) >= 0);
++    if (alreadyOk) {
++      done.add(fullName);
++      return;
++    }
++
++    const target =
++      (!isDependency && rootVersion
++        ? pkg.versions.find((v) => v.version === rootVersion)
++        : undefined) ?? pkg.versions[0];
++
++    visiting.add(fullName);
++    for (const raw of target.dependencies) {
++      const dep = parseDependency(raw);
++      if (!dep) continue;
++      visit(dep.fullName, dep.version, true);
++    }
++    visiting.delete(fullName);
++
++    done.add(fullName);
++    plan.push({
++      fullName,
++      version: target.version,
++      downloadUrl: target.downloadUrl,
++      isDependency,
++    });
++  };
++
++  visit(rootFullName, undefined, false);
++  return { plan, missing };
++};
++
++/** Installed mods that nothing else installed depends on (for safe cleanup). */
++export const findOrphanedDependencies = (
++  installed: Record<string, { isDependency: boolean }>,
++  index: Map<string, ThunderstorePackage>,
++  installedVersions: Record<string, string>
++): string[] => {
++  const needed = new Set<string>();
++  for (const [fullName, mod] of Object.entries(installed)) {
++    if (mod.isDependency) continue;
++    const stack = [fullName];
++    while (stack.length) {
++      const cur = stack.pop()!;
++      if (needed.has(cur)) continue;
++      needed.add(cur);
++      const pkg = index.get(cur);
++      const version =
++        pkg?.versions.find((v) => v.version === installedVersions[cur]) ??
++        pkg?.versions[0];
++      for (const raw of version?.dependencies ?? []) {
++        const dep = parseDependency(raw);
++        if (dep && installed[dep.fullName]) stack.push(dep.fullName);
++      }
++    }
++  }
++  return Object.keys(installed).filter((n) => !needed.has(n));
++};
+diff --git a/src/main/services/mods/ecosystem.ts b/src/main/services/mods/ecosystem.ts
+new file mode 100644
+index 0000000..96b764b
+--- /dev/null
++++ b/src/main/services/mods/ecosystem.ts
+@@ -0,0 +1,130 @@
++import fs from "node:fs";
++import path from "node:path";
++import axios from "axios";
++import { logger } from "../logger";
++import { modsCachePath } from "./paths";
++import type { ThunderstoreCommunity } from "../../../types/mods.types";
++
++const ECOSYSTEM_URL =
++  "https://thunderstore.io/api/experimental/schema/dev/latest/";
++const COMMUNITY_LIST_URL =
++  "https://thunderstore.io/api/experimental/community/";
++const TTL_MS = 24 * 60 * 60 * 1000;
++const UA = { "User-Agent": "HydraLauncher-ModManager" };
++
++export interface EcosystemGame extends ThunderstoreCommunity {
++  steamIds: string[];
++  packageLoader: string | null;
++}
++
++let memory: { at: number; games: EcosystemGame[] } | null = null;
++const cacheFile = path.join(modsCachePath, "ecosystem.json");
++
++/**
++ * The ecosystem schema is "experimental" on Thunderstore's side, so every
++ * field is read defensively and unknown shapes are skipped, not thrown on.
++ */
++export const parseEcosystem = (raw: any): EcosystemGame[] => {
++  const games = raw?.games;
++  if (!games || typeof games !== "object") return [];
++
++  return Object.entries<any>(games).map(([identifier, game]) => {
++    const distributions: any[] = Array.isArray(game?.distributions)
++      ? game.distributions
++      : [];
++    const steamIds = distributions
++      .filter(
++        (d) =>
++          typeof d?.platform === "string" &&
++          d.platform.toLowerCase().startsWith("steam") &&
++          d.identifier
++      )
++      .map((d) => String(d.identifier));
++
++    const r2 = Array.isArray(game?.r2modman) ? game.r2modman[0] : undefined;
++
++    return {
++      identifier,
++      name: game?.meta?.displayName ?? game?.label ?? identifier,
++      steamIds,
++      packageLoader: r2?.packageLoader ?? null,
++    };
++  });
++};
++
++const readDisk = async (): Promise<typeof memory> => {
++  try {
++    const stat = await fs.promises.stat(cacheFile);
++    const games = JSON.parse(await fs.promises.readFile(cacheFile, "utf8"));
++    return { at: stat.mtimeMs, games };
++  } catch {
++    return null;
++  }
++};
++
++const fallbackFromCommunityList = async (): Promise<EcosystemGame[]> => {
++  const out: EcosystemGame[] = [];
++  let url: string | null = COMMUNITY_LIST_URL;
++  while (url && out.length < 2000) {
++    const { data } = await axios.get(url, { headers: UA, timeout: 20_000 });
++    for (const c of data?.results ?? []) {
++      out.push({
++        identifier: c.identifier,
++        name: c.name ?? c.identifier,
++        steamIds: [],
++        packageLoader: null,
++      });
++    }
++    url = data?.pagination?.next_link ?? null;
++  }
++  return out;
++};
++
++export const getEcosystem = async (force = false): Promise<EcosystemGame[]> => {
++  if (!force && memory && Date.now() - memory.at < TTL_MS) return memory.games;
++
++  if (!force) {
++    const disk = await readDisk();
++    if (disk && Date.now() - disk.at < TTL_MS) {
++      memory = disk;
++      return disk.games;
++    }
++  }
++
++  try {
++    const { data } = await axios.get(ECOSYSTEM_URL, {
++      headers: UA,
++      timeout: 30_000,
++    });
++    let games = parseEcosystem(data);
++    if (games.length === 0) games = await fallbackFromCommunityList();
++
++    memory = { at: Date.now(), games };
++    await fs.promises.mkdir(modsCachePath, { recursive: true });
++    await fs.promises.writeFile(cacheFile, JSON.stringify(games));
++    return games;
++  } catch (error) {
++    logger.error("Failed to fetch Thunderstore ecosystem", error);
++    const stale = memory ?? (await readDisk());
++    if (stale) return stale.games;
++    throw error;
++  }
++};
++
++export const findGameBySteamId = async (
++  steamId: string
++): Promise<EcosystemGame | null> => {
++  const games = await getEcosystem();
++  return games.find((g) => g.steamIds.includes(String(steamId))) ?? null;
++};
++
++/** Fuzzy fallback for non-Steam games: exact normalised-title match only. */
++export const findGameByTitle = async (
++  title: string
++): Promise<EcosystemGame | null> => {
++  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
++  const wanted = norm(title);
++  if (!wanted) return null;
++  const games = await getEcosystem();
++  return games.find((g) => norm(g.name) === wanted) ?? null;
++};
+diff --git a/src/main/services/mods/index.ts b/src/main/services/mods/index.ts
+new file mode 100644
+index 0000000..b6da28a
+--- /dev/null
++++ b/src/main/services/mods/index.ts
+@@ -0,0 +1,3 @@
++export * from "./installer";
++export { getEcosystem } from "./ecosystem";
++export { getPackageIndex, searchPackages } from "./package-index";
+diff --git a/src/main/services/mods/installer.ts b/src/main/services/mods/installer.ts
+new file mode 100644
+index 0000000..a38ddb3
+--- /dev/null
++++ b/src/main/services/mods/installer.ts
+@@ -0,0 +1,399 @@
++import fs from "node:fs";
++import path from "node:path";
++import { logger } from "../logger";
++import { SevenZip } from "../7zip";
++import { downloadToFile, removeFileQuietly } from "../download-to-file";
++import { gamesSublevel, levelKeys } from "@main/level";
++import { WindowManager } from "../window-manager";
++import type { GameShop } from "@types";
++import type {
++  GameModState,
++  InstalledMod,
++  ModGameStatus,
++  ModLoaderId,
++  ModProgressEvent,
++} from "../../../types/mods.types";
++import { findOrphanedDependencies, resolveInstallPlan } from "./dependencies";
++import { findGameBySteamId, findGameByTitle } from "./ecosystem";
++import { LOADERS, isSafeRelativePath, toSupportedLoader } from "./loaders";
++import { getPackageIndex } from "./package-index";
++import {
++  gameKey,
++  modsBackupsPath,
++  modsDownloadsPath,
++  modsTempPath,
++} from "./paths";
++import { readState, withGameLock, writeState } from "./state";
++
++const DISABLED_SUFFIX = ".old";
++
++const emit = (event: ModProgressEvent) =>
++  WindowManager.mainWindow?.webContents.send("on-mod-progress", event);
++
++const exists = (p: string) =>
++  fs.promises.access(p).then(
++    () => true,
++    () => false
++  );
++
++const walk = async (dir: string, base = dir): Promise<string[]> => {
++  const out: string[] = [];
++  for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
++    const full = path.join(dir, entry.name);
++    if (entry.isDirectory()) out.push(...(await walk(full, base)));
++    else if (entry.isFile())
++      out.push(path.relative(base, full).split(path.sep).join("/"));
++  }
++  return out;
++};
++
++const pruneEmptyDirs = async (startDir: string, stopAt: string) => {
++  let dir = startDir;
++  while (dir.startsWith(stopAt) && dir !== stopAt) {
++    try {
++      await fs.promises.rmdir(dir); // only succeeds when empty
++    } catch {
++      return;
++    }
++    dir = path.dirname(dir);
++  }
++};
++
++const getGameDir = async (shop: GameShop, objectId: string) => {
++  const game = await gamesSublevel.get(levelKeys.game(shop, objectId));
++  if (!game?.executablePath) return { game, gameDir: null };
++  return { game, gameDir: path.dirname(game.executablePath) };
++};
++
++/** Works out community + loader once and remembers it (user can override). */
++export const resolveGameSupport = async (
++  shop: GameShop,
++  objectId: string
++): Promise<GameModState> => {
++  const state = await readState(shop, objectId);
++  if (state.community && state.loader) return state;
++
++  const { game } = await getGameDir(shop, objectId);
++  const eco =
++    (shop === "steam" ? await findGameBySteamId(objectId) : null) ??
++    (game?.title ? await findGameByTitle(game.title) : null);
++
++  if (eco) {
++    state.community = state.community ?? eco.identifier;
++    state.loader = toSupportedLoader(eco.packageLoader);
++    await writeState(shop, objectId, state);
++  }
++  return state;
++};
++
++export const setGameCommunity = async (
++  shop: GameShop,
++  objectId: string,
++  community: string,
++  loader?: ModLoaderId
++) =>
++  withGameLock(shop, objectId, async () => {
++    const state = await readState(shop, objectId);
++    state.community = community;
++    state.loader = loader ?? "bepinex";
++    await writeState(shop, objectId, state);
++  });
++
++export const getGameStatus = async (
++  shop: GameShop,
++  objectId: string
++): Promise<ModGameStatus> => {
++  const { gameDir } = await getGameDir(shop, objectId);
++  const state = await resolveGameSupport(shop, objectId);
++  return {
++    community: state.community,
++    loader: state.loader,
++    gameDir,
++    installed: Object.values(state.installed),
++  };
++};
++
++const backupPathFor = (
++  shop: string,
++  objectId: string,
++  fullName: string,
++  rel: string
++) =>
++  path.join(
++    modsBackupsPath,
++    gameKey(shop, objectId),
++    fullName,
++    ...rel.split("/")
++  );
++
++const removeInstalledFiles = async (gameDir: string, mod: InstalledMod) => {
++  for (const rel of mod.files) {
++    const target = path.join(gameDir, ...rel.split("/"));
++    await removeFileQuietly(target);
++    await removeFileQuietly(target + DISABLED_SUFFIX);
++    await pruneEmptyDirs(path.dirname(target), gameDir);
++
++    const backup = mod.backups[rel];
++    if (backup && (await exists(backup))) {
++      await fs.promises.mkdir(path.dirname(target), { recursive: true });
++      await fs.promises.copyFile(backup, target);
++      await removeFileQuietly(backup);
++    }
++  }
++};
++
++const installOne = async (
++  shop: GameShop,
++  objectId: string,
++  gameDir: string,
++  state: GameModState,
++  step: {
++    fullName: string;
++    version: string;
++    downloadUrl: string;
++    isDependency: boolean;
++  },
++  progress: (percent: number, stage: ModProgressEvent["stage"]) => void
++) => {
++  const loader = LOADERS[state.loader!];
++  const name = step.fullName.slice(step.fullName.indexOf("-") + 1);
++  const isLoaderPkg = loader.isLoaderPackage(name);
++
++  const zipPath = path.join(
++    modsDownloadsPath,
++    `${step.fullName}-${step.version}.zip`
++  );
++  const tempDir = path.join(
++    modsTempPath,
++    `${gameKey(shop, objectId)}-${step.fullName}-${Date.now()}`
++  );
++
++  try {
++    if (!(await exists(zipPath))) {
++      await downloadToFile(step.downloadUrl, zipPath, (loaded, total) =>
++        progress(total ? Math.round((loaded / total) * 60) : 30, "downloading")
++      );
++    }
++
++    progress(65, "extracting");
++    await fs.promises.mkdir(tempDir, { recursive: true });
++    const result = await SevenZip.extractFile({
++      filePath: zipPath,
++      outputPath: tempDir,
++    });
++    if (!result.success) throw new Error(`Failed to extract ${step.fullName}`);
++
++    const files = await walk(tempDir);
++    const moves = isLoaderPkg
++      ? loader.planLoader(files)
++      : loader.planMod(files, step.fullName);
++
++    const unsafe = moves.find((m) => !isSafeRelativePath(m.to));
++    if (unsafe) throw new Error(`Unsafe path in package: ${unsafe.to}`);
++
++    // Upgrade/reinstall: remove the previous version cleanly first.
++    const previous = state.installed[step.fullName];
++    if (previous) {
++      await removeInstalledFiles(gameDir, previous);
++      delete state.installed[step.fullName];
++    }
++
++    progress(80, "installing");
++    const owned = new Set(
++      Object.values(state.installed).flatMap((m) => m.files)
++    );
++    const installedFiles: string[] = [];
++    const backups: Record<string, string> = {};
++
++    for (const move of moves) {
++      const dest = path.join(gameDir, ...move.to.split("/"));
++      await fs.promises.mkdir(path.dirname(dest), { recursive: true });
++
++      // Preserve any pre-existing file we don't own so uninstall can restore it.
++      if ((await exists(dest)) && !owned.has(move.to)) {
++        const backup = backupPathFor(shop, objectId, step.fullName, move.to);
++        await fs.promises.mkdir(path.dirname(backup), { recursive: true });
++        await fs.promises.copyFile(dest, backup);
++        backups[move.to] = backup;
++      }
++
++      await fs.promises.copyFile(
++        path.join(tempDir, ...move.from.split("/")),
++        dest
++      );
++      installedFiles.push(move.to);
++    }
++
++    state.installed[step.fullName] = {
++      fullName: step.fullName,
++      version: step.version,
++      files: installedFiles,
++      backups,
++      enabled: true,
++      isDependency: previous
++        ? previous.isDependency && step.isDependency
++        : step.isDependency,
++      installedAt: new Date().toISOString(),
++    };
++  } finally {
++    await fs.promises
++      .rm(tempDir, { recursive: true, force: true })
++      .catch(() => {});
++  }
++};
++
++export const installMod = (
++  shop: GameShop,
++  objectId: string,
++  fullName: string,
++  version?: string
++) =>
++  withGameLock(shop, objectId, async () => {
++    const report = (
++      stage: ModProgressEvent["stage"],
++      percent: number,
++      message?: string,
++      name = fullName
++    ) => emit({ shop, objectId, fullName: name, stage, percent, message });
++
++    try {
++      report("resolving", 0);
++      const { gameDir } = await getGameDir(shop, objectId);
++      if (!gameDir) {
++        throw new Error(
++          "Set the game's executable first so Hydra knows where to install mods."
++        );
++      }
++
++      const state = await resolveGameSupport(shop, objectId);
++      if (!state.community)
++        throw new Error("No Thunderstore community selected for this game.");
++      if (!state.loader) {
++        throw new Error(
++          "This game uses a mod loader that isn't supported yet."
++        );
++      }
++
++      const { map } = await getPackageIndex(state.community);
++      const { plan, missing } = resolveInstallPlan(
++        fullName,
++        map,
++        state.installed,
++        version
++      );
++      if (!plan.some((p) => p.fullName === fullName)) {
++        throw new Error(`Package not found: ${fullName}`);
++      }
++      if (missing.length)
++        logger.warn("Missing Thunderstore dependencies", missing);
++
++      for (let i = 0; i < plan.length; i++) {
++        const step = plan[i];
++        const base = (i / plan.length) * 100;
++        const span = 100 / plan.length;
++        await installOne(shop, objectId, gameDir, state, step, (p, stage) =>
++          report(
++            stage,
++            Math.round(base + (p / 100) * span),
++            undefined,
++            step.fullName
++          )
++        );
++        await writeState(shop, objectId, state); // persist after each package
++      }
++
++      report(
++        "done",
++        100,
++        missing.length
++          ? `Missing dependencies: ${missing.join(", ")}`
++          : undefined
++      );
++      return { installed: plan.map((p) => p.fullName), missing };
++    } catch (error) {
++      logger.error(`Mod install failed: ${fullName}`, error);
++      report(
++        "error",
++        0,
++        error instanceof Error ? error.message : String(error)
++      );
++      throw error;
++    }
++  });
++
++export const uninstallMod = (
++  shop: GameShop,
++  objectId: string,
++  fullName: string,
++  removeOrphans = true
++) =>
++  withGameLock(shop, objectId, async () => {
++    const { gameDir } = await getGameDir(shop, objectId);
++    if (!gameDir) throw new Error("Game directory unknown.");
++
++    const state = await readState(shop, objectId);
++    const mod = state.installed[fullName];
++    if (!mod) return { removed: [] as string[] };
++
++    const removed = [fullName];
++    await removeInstalledFiles(gameDir, mod);
++    delete state.installed[fullName];
++
++    if (removeOrphans && state.community) {
++      try {
++        const { map } = await getPackageIndex(state.community);
++        const versions = Object.fromEntries(
++          Object.values(state.installed).map((m) => [m.fullName, m.version])
++        );
++        for (const orphan of findOrphanedDependencies(
++          state.installed,
++          map,
++          versions
++        )) {
++          await removeInstalledFiles(gameDir, state.installed[orphan]);
++          delete state.installed[orphan];
++          removed.push(orphan);
++        }
++      } catch (error) {
++        logger.warn("Orphan cleanup skipped", error);
++      }
++    }
++
++    await writeState(shop, objectId, state);
++    return { removed };
++  });
++
++export const setModEnabled = (
++  shop: GameShop,
++  objectId: string,
++  fullName: string,
++  enabled: boolean
++) =>
++  withGameLock(shop, objectId, async () => {
++    const { gameDir } = await getGameDir(shop, objectId);
++    if (!gameDir) throw new Error("Game directory unknown.");
++
++    const state = await readState(shop, objectId);
++    const mod = state.installed[fullName];
++    if (!mod || mod.enabled === enabled) return;
++
++    const loader = state.loader ? LOADERS[state.loader] : null;
++    const name = fullName.slice(fullName.indexOf("-") + 1);
++    if (loader?.isLoaderPackage(name)) {
++      throw new Error(
++        "The mod loader can't be disabled; uninstall it instead."
++      );
++    }
++
++    for (const rel of mod.files) {
++      if (loader?.keepOnDisable.some((p) => rel.startsWith(p))) continue;
++      const live = path.join(gameDir, ...rel.split("/"));
++      const [from, to] = enabled
++        ? [live + DISABLED_SUFFIX, live]
++        : [live, live + DISABLED_SUFFIX];
++      if (await exists(from)) await fs.promises.rename(from, to);
++    }
++
++    mod.enabled = enabled;
++    await writeState(shop, objectId, state);
++  });
+diff --git a/src/main/services/mods/loaders.ts b/src/main/services/mods/loaders.ts
+new file mode 100644
+index 0000000..b13a700
+--- /dev/null
++++ b/src/main/services/mods/loaders.ts
+@@ -0,0 +1,145 @@
++import type { ModLoaderId } from "../../../types/mods.types";
++
++export interface FileMove {
++  from: string; // path inside the extracted package (posix, relative)
++  to: string; // path relative to game dir (posix)
++}
++
++export interface LoaderDefinition {
++  id: ModLoaderId;
++  /** Does this package name (without owner) install the loader itself? */
++  isLoaderPackage: (name: string) => boolean;
++  planLoader: (files: string[]) => FileMove[];
++  planMod: (files: string[], fullName: string) => FileMove[];
++  /** Files under these prefixes are never renamed when a mod is disabled. */
++  keepOnDisable: string[];
++}
++
++const PACKAGE_META = new Set([
++  "manifest.json",
++  "icon.png",
++  "readme.md",
++  "changelog.md",
++  "license",
++  "license.txt",
++  "license.md",
++]);
++
++const isMeta = (rel: string) =>
++  !rel.includes("/") && PACKAGE_META.has(rel.toLowerCase());
++
++const normalize = (p: string) => p.replace(/\\/g, "/").replace(/^\/+/, "");
++
++const topOf = (rel: string) => rel.split("/")[0];
++
++/** Strips a single wrapping folder shared by every file (e.g. BepInExPack/). */
++const stripWrapper = (files: string[]): string[] => {
++  const tops = new Set(files.map(topOf));
++  const allNested = files.every((f) => f.includes("/"));
++  return tops.size === 1 && allNested
++    ? files.map((f) => f.slice(f.indexOf("/") + 1))
++    : files;
++};
++
++const bepinex: LoaderDefinition = {
++  id: "bepinex",
++  keepOnDisable: ["BepInEx/config/"],
++  isLoaderPackage: (name) =>
++    /^bepinexpack/i.test(name) || /^bepinex_pack/i.test(name),
++
++  planLoader(rawFiles) {
++    const files = rawFiles.map(normalize).filter((f) => !isMeta(f));
++    const stripped = stripWrapper(files);
++    return files.map((from, i) => ({ from, to: stripped[i] }));
++  },
++
++  planMod(rawFiles, fullName) {
++    const files = rawFiles.map(normalize).filter((f) => !isMeta(f));
++    const moves: FileMove[] = [];
++
++    for (const from of files) {
++      const parts = from.split("/");
++      const top = parts[0].toLowerCase();
++      const rest = parts.slice(1).join("/");
++
++      if (top === "bepinex" && parts.length > 1) {
++        moves.push({ from, to: from });
++      } else if (parts.length === 1) {
++        moves.push({ from, to: `BepInEx/plugins/${fullName}/${from}` });
++      } else if (
++        top === "plugins" ||
++        top === "patchers" ||
++        top === "monomod" ||
++        top === "core"
++      ) {
++        moves.push({ from, to: `BepInEx/${top}/${fullName}/${rest}` });
++      } else if (top === "config") {
++        moves.push({ from, to: `BepInEx/config/${rest}` });
++      } else {
++        moves.push({ from, to: `BepInEx/plugins/${fullName}/${from}` });
++      }
++    }
++    return moves;
++  },
++};
++
++const MELON_FOLDERS: Record<string, string> = {
++  mods: "Mods",
++  plugins: "Plugins",
++  userlibs: "UserLibs",
++  userdata: "UserData",
++  melonloader: "MelonLoader",
++};
++
++const melonloader: LoaderDefinition = {
++  id: "melonloader",
++  keepOnDisable: ["UserData/"],
++  isLoaderPackage: (name) => /^melonloader$/i.test(name),
++
++  planLoader(rawFiles) {
++    return rawFiles
++      .map(normalize)
++      .filter((f) => !isMeta(f))
++      .map((from) => ({ from, to: from }));
++  },
++
++  planMod(rawFiles) {
++    const moves: FileMove[] = [];
++    for (const from of rawFiles.map(normalize).filter((f) => !isMeta(f))) {
++      const parts = from.split("/");
++      const mapped = MELON_FOLDERS[parts[0].toLowerCase()];
++      if (mapped && parts.length > 1) {
++        moves.push({ from, to: `${mapped}/${parts.slice(1).join("/")}` });
++      } else {
++        moves.push({ from, to: `Mods/${from}` });
++      }
++    }
++    return moves;
++  },
++};
++
++export const LOADERS: Record<ModLoaderId, LoaderDefinition> = {
++  bepinex,
++  melonloader,
++};
++
++/** Maps r2modman/ecosystem `packageLoader` strings to supported loaders. */
++export const toSupportedLoader = (
++  raw: string | undefined | null
++): ModLoaderId | null => {
++  const key = (raw ?? "bepinex").toLowerCase().replace(/[^a-z]/g, "");
++  if (key === "bepinex") return "bepinex";
++  if (key === "melonloader" || key === "recursivemelonloader")
++    return "melonloader";
++  return null;
++};
++
++/** Guards against zip-slip: destination must stay inside the game dir. */
++export const isSafeRelativePath = (rel: string): boolean => {
++  const n = normalize(rel);
++  return (
++    !!n &&
++    !n.split("/").some((s) => s === ".." || s === "") &&
++    !/^[a-zA-Z]:/.test(n)
++  );
++};
+diff --git a/src/main/services/mods/mods-core.test.ts b/src/main/services/mods/mods-core.test.ts
+new file mode 100644
+index 0000000..daded32
+--- /dev/null
++++ b/src/main/services/mods/mods-core.test.ts
+@@ -0,0 +1,161 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  compareVersions,
++  findOrphanedDependencies,
++  parseDependency,
++  resolveInstallPlan,
++} from "./dependencies";
++import { LOADERS, isSafeRelativePath, toSupportedLoader } from "./loaders";
++import type { ThunderstorePackage } from "../../../types/mods.types";
++
++const pkg = (
++  fullName: string,
++  versions: [string, string[]][]
++): ThunderstorePackage => ({
++  fullName,
++  owner: fullName.split("-")[0],
++  name: fullName.split("-").slice(1).join("-"),
++  description: "",
++  icon: "",
++  rating: 0,
++  downloads: 0,
++  categories: [],
++  isDeprecated: false,
++  isNsfw: false,
++  dateUpdated: "",
++  packageUrl: "",
++  versions: versions.map(([version, dependencies]) => ({
++    version,
++    dependencies,
++    downloadUrl: `https://x/${fullName}/${version}`,
++    fileSize: 1,
++  })),
++});
++
++const index = new Map(
++  [
++    pkg("bbepis-BepInExPack", [
++      ["5.4.2100", []],
++      ["5.4.2000", []],
++    ]),
++    pkg("A-ModA", [
++      ["1.0.0", ["bbepis-BepInExPack-5.4.2000", "B-Lib_B-1.0.0"]],
++    ]),
++    pkg("B-Lib_B", [["1.2.0", ["bbepis-BepInExPack-5.4.2000"]]]),
++    pkg("C-Cyc", [["1.0.0", ["D-Cyc2-1.0.0"]]]),
++    pkg("D-Cyc2", [["1.0.0", ["C-Cyc-1.0.0"]]]),
++    pkg("E-Broken", [["1.0.0", ["Nope-Missing-1.0.0"]]]),
++  ].map((p) => [p.fullName, p])
++);
++
++test("parseDependency handles underscores and dashes in names", () => {
++  assert.deepEqual(parseDependency("B-Lib_B-1.0.0"), {
++    owner: "B",
++    name: "Lib_B",
++    version: "1.0.0",
++    fullName: "B-Lib_B",
++  });
++  assert.equal(parseDependency("garbage"), null);
++});
++
++test("compareVersions", () => {
++  assert.equal(compareVersions("1.10.0", "1.9.9"), 1);
++  assert.equal(compareVersions("1.0", "1.0.0"), 0);
++  assert.equal(compareVersions("0.9.9", "1.0.0"), -1);
++});
++
++test("plan installs dependencies first, loader once, newest version", () => {
++  const { plan, missing } = resolveInstallPlan("A-ModA", index, {});
++  assert.deepEqual(
++    plan.map((p) => p.fullName),
++    ["bbepis-BepInExPack", "B-Lib_B", "A-ModA"]
++  );
++  assert.equal(plan[0].version, "5.4.2100");
++  assert.equal(plan[2].isDependency, false);
++  assert.deepEqual(missing, []);
++});
++
++test("installed deps that satisfy the minimum are skipped", () => {
++  const { plan } = resolveInstallPlan("A-ModA", index, {
++    "bbepis-BepInExPack": { version: "5.4.2000" },
++  });
++  assert.deepEqual(
++    plan.map((p) => p.fullName),
++    ["B-Lib_B", "A-ModA"]
++  );
++});
++
++test("cycles terminate and missing deps are reported", () => {
++  assert.equal(resolveInstallPlan("C-Cyc", index, {}).plan.length, 2);
++  assert.deepEqual(resolveInstallPlan("E-Broken", index, {}).missing, [
++    "Nope-Missing",
++  ]);
++});
++
++test("orphan detection keeps deps of explicitly installed mods", () => {
++  const installed = {
++    "A-ModA": { isDependency: false },
++    "B-Lib_B": { isDependency: true },
++    "bbepis-BepInExPack": { isDependency: true },
++    "C-Cyc": { isDependency: true },
++  };
++  const versions = {
++    "A-ModA": "1.0.0",
++    "B-Lib_B": "1.2.0",
++    "bbepis-BepInExPack": "5.4.2100",
++    "C-Cyc": "1.0.0",
++  };
++  assert.deepEqual(findOrphanedDependencies(installed, index, versions), [
++    "C-Cyc",
++  ]);
++});
++
++test("bepinex loader strips wrapper folder, skips meta files", () => {
++  const moves = LOADERS.bepinex.planLoader([
++    "manifest.json",
++    "icon.png",
++    "BepInExPack/winhttp.dll",
++    "BepInExPack/BepInEx/core/BepInEx.dll",
++  ]);
++  assert.deepEqual(
++    moves.map((m) => m.to),
++    ["winhttp.dll", "BepInEx/core/BepInEx.dll"]
++  );
++});
++
++test("bepinex mod layouts", () => {
++  const m = (files: string[]) =>
++    LOADERS.bepinex.planMod(files, "A-ModA").map((x) => x.to);
++  assert.deepEqual(m(["manifest.json", "Mod.dll"]), [
++    "BepInEx/plugins/A-ModA/Mod.dll",
++  ]);
++  assert.deepEqual(m(["plugins/Mod.dll", "config/a.cfg"]), [
++    "BepInEx/plugins/A-ModA/Mod.dll",
++    "BepInEx/config/a.cfg",
++  ]);
++  assert.deepEqual(m(["BepInEx/plugins/Mod.dll"]), ["BepInEx/plugins/Mod.dll"]);
++  assert.deepEqual(m(["Stuff/data.json"]), [
++    "BepInEx/plugins/A-ModA/Stuff/data.json",
++  ]);
++});
++
++test("melonloader mod layouts", () => {
++  const m = (files: string[]) =>
++    LOADERS.melonloader.planMod(files, "A-ModA").map((x) => x.to);
++  assert.deepEqual(m(["Mods/x.dll", "UserLibs/y.dll", "z.dll"]), [
++    "Mods/x.dll",
++    "UserLibs/y.dll",
++    "Mods/z.dll",
++  ]);
++});
++
++test("path safety and loader mapping", () => {
++  assert.equal(isSafeRelativePath("BepInEx/plugins/a.dll"), true);
++  assert.equal(isSafeRelativePath("../evil.dll"), false);
++  assert.equal(isSafeRelativePath("a/../../evil"), false);
++  assert.equal(isSafeRelativePath("C:/evil"), false);
++  assert.equal(toSupportedLoader("bepinex"), "bepinex");
++  assert.equal(toSupportedLoader("gdweave"), null);
++  assert.equal(toSupportedLoader(undefined), "bepinex");
++});
+diff --git a/src/main/services/mods/package-index.ts b/src/main/services/mods/package-index.ts
+new file mode 100644
+index 0000000..551f09a
+--- /dev/null
++++ b/src/main/services/mods/package-index.ts
+@@ -0,0 +1,198 @@
++import fs from "node:fs";
++import path from "node:path";
++import axios from "axios";
++import { logger } from "../logger";
++import { modsCachePath } from "./paths";
++import type {
++  ModSearchOptions,
++  ModSearchResult,
++  ThunderstorePackage,
++} from "../../../types/mods.types";
++
++const REFRESH_AFTER_MS = 60 * 60 * 1000;
++const UA = { "User-Agent": "HydraLauncher-ModManager" };
++
++interface CacheEntry {
++  community: string;
++  fetchedAt: number;
++  etag: string | null;
++  lastModified: string | null;
++  packages: ThunderstorePackage[];
++}
++
++const memory = new Map<
++  string,
++  CacheEntry & { map: Map<string, ThunderstorePackage> }
++>();
++const inflight = new Map<string, Promise<void>>();
++
++const fileFor = (community: string) =>
++  path.join(modsCachePath, `${community.replace(/[^a-z0-9_-]/gi, "_")}.json`);
++
++const slim = (raw: any[]): ThunderstorePackage[] =>
++  raw
++    .filter((p) => Array.isArray(p?.versions) && p.versions.length > 0)
++    .map((p) => {
++      const latest = p.versions[0];
++      return {
++        fullName: p.full_name,
++        owner: p.owner,
++        name: p.name,
++        description: latest.description ?? "",
++        icon: latest.icon ?? "",
++        rating: p.rating_score ?? 0,
++        downloads: p.versions.reduce(
++          (sum: number, v: any) => sum + (v.downloads ?? 0),
++          0
++        ),
++        categories: p.categories ?? [],
++        isDeprecated: !!p.is_deprecated,
++        isNsfw: !!p.has_nsfw_content,
++        dateUpdated: p.date_updated ?? latest.date_created ?? "",
++        packageUrl: p.package_url ?? "",
++        versions: p.versions.map((v: any) => ({
++          version: v.version_number,
++          dependencies: v.dependencies ?? [],
++          downloadUrl: v.download_url,
++          fileSize: v.file_size ?? 0,
++        })),
++      } satisfies ThunderstorePackage;
++    });
++
++const hydrate = (entry: CacheEntry) => {
++  const map = new Map(entry.packages.map((p) => [p.fullName, p]));
++  const full = { ...entry, map };
++  memory.set(entry.community, full);
++  return full;
++};
++
++const loadFromDisk = async (community: string) => {
++  try {
++    const entry: CacheEntry = JSON.parse(
++      await fs.promises.readFile(fileFor(community), "utf8")
++    );
++    return hydrate(entry);
++  } catch {
++    return null;
++  }
++};
++
++const refresh = async (community: string) => {
++  const existing = memory.get(community);
++  const headers: Record<string, string> = { ...UA };
++  if (existing?.etag) headers["If-None-Match"] = existing.etag;
++  if (existing?.lastModified)
++    headers["If-Modified-Since"] = existing.lastModified;
++
++  const response = await axios.get(
++    `https://thunderstore.io/c/${encodeURIComponent(community)}/api/v1/package/`,
++    {
++      headers,
++      timeout: 120_000,
++      maxContentLength: Infinity,
++      maxBodyLength: Infinity,
++      validateStatus: (s) => (s >= 200 && s < 300) || s === 304,
++    }
++  );
++
++  if (response.status === 304 && existing) {
++    existing.fetchedAt = Date.now();
++    await persist(existing);
++    return;
++  }
++
++  const entry: CacheEntry = {
++    community,
++    fetchedAt: Date.now(),
++    etag: response.headers["etag"] ?? null,
++    lastModified: response.headers["last-modified"] ?? null,
++    packages: slim(Array.isArray(response.data) ? response.data : []),
++  };
++  hydrate(entry);
++  await persist(entry);
++};
++
++const persist = async (entry: CacheEntry) => {
++  const { packages, ...rest } = entry;
++  await fs.promises.mkdir(modsCachePath, { recursive: true });
++  await fs.promises.writeFile(
++    fileFor(entry.community),
++    JSON.stringify({ ...rest, packages })
++  );
++};
++
++/** Returns the cached index, refreshing it in the background-safe way. */
++export const getPackageIndex = async (community: string, force = false) => {
++  let entry = memory.get(community) ?? (await loadFromDisk(community));
++  const stale = !entry || Date.now() - entry.fetchedAt > REFRESH_AFTER_MS;
++
++  if (force || stale) {
++    let job = inflight.get(community);
++    if (!job) {
++      job = refresh(community).finally(() => inflight.delete(community));
++      inflight.set(community, job);
++    }
++    try {
++      await job;
++    } catch (error) {
++      logger.error(
++        `Failed to refresh Thunderstore index (${community})`,
++        error
++      );
++      if (!entry) throw error; // no cache to fall back to
++    }
++    entry = memory.get(community) ?? entry;
++  }
++
++  return entry!;
++};
++
++export const searchPackages = async (
++  community: string,
++  options: ModSearchOptions = {}
++): Promise<ModSearchResult> => {
++  const {
++    query = "",
++    sort = "downloads",
++    page = 0,
++    pageSize = 30,
++    category,
++    includeDeprecated = false,
++    includeNsfw = false,
++  } = options;
++
++  const { packages } = await getPackageIndex(community);
++  const q = query.trim().toLowerCase();
++
++  const categories = new Set<string>();
++  for (const p of packages) p.categories.forEach((c) => categories.add(c));
++
++  let items = packages.filter((p) => {
++    if (!includeDeprecated && p.isDeprecated) return false;
++    if (!includeNsfw && p.isNsfw) return false;
++    if (category && !p.categories.includes(category)) return false;
++    if (!q) return true;
++    return (
++      p.name.toLowerCase().includes(q) ||
++      p.owner.toLowerCase().includes(q) ||
++      p.description.toLowerCase().includes(q)
++    );
++  });
++
++  const sorters: Record<
++    string,
++    (a: ThunderstorePackage, b: ThunderstorePackage) => number
++  > = {
++    downloads: (a, b) => b.downloads - a.downloads,
++    rating: (a, b) => b.rating - a.rating,
++    updated: (a, b) => b.dateUpdated.localeCompare(a.dateUpdated),
++    name: (a, b) => a.name.localeCompare(b.name),
++  };
++  items = [...items].sort(sorters[sort] ?? sorters.downloads);
++
++  return {
++    total: items.length,
++    items: items.slice(page * pageSize, (page + 1) * pageSize),
++    categories: [...categories].sort(),
++  };
++};
+diff --git a/src/main/services/mods/paths.ts b/src/main/services/mods/paths.ts
+new file mode 100644
+index 0000000..0ef0baf
+--- /dev/null
++++ b/src/main/services/mods/paths.ts
+@@ -0,0 +1,12 @@
++import path from "node:path";
++import { SystemPath } from "../system-path";
++
++export const modsRoot = path.join(SystemPath.getPath("userData"), "Mods");
++export const modsCachePath = path.join(modsRoot, "cache");
++export const modsDownloadsPath = path.join(modsRoot, "downloads");
++export const modsStatePath = path.join(modsRoot, "state");
++export const modsBackupsPath = path.join(modsRoot, "backups");
++export const modsTempPath = path.join(modsRoot, "tmp");
++
++export const gameKey = (shop: string, objectId: string) =>
++  `${shop}-${objectId}`.replace(/[^a-zA-Z0-9_.-]/g, "_");
+diff --git a/src/main/services/mods/state.ts b/src/main/services/mods/state.ts
+new file mode 100644
+index 0000000..614c45b
+--- /dev/null
++++ b/src/main/services/mods/state.ts
+@@ -0,0 +1,54 @@
++import fs from "node:fs";
++import path from "node:path";
++import { gameKey, modsStatePath } from "./paths";
++import type { GameModState } from "../../../types/mods.types";
++
++const emptyState = (): GameModState => ({
++  community: null,
++  loader: null,
++  installed: {},
++});
++
++export const readState = async (
++  shop: string,
++  objectId: string
++): Promise<GameModState> => {
++  try {
++    const raw = await fs.promises.readFile(
++      path.join(modsStatePath, `${gameKey(shop, objectId)}.json`),
++      "utf8"
++    );
++    return { ...emptyState(), ...JSON.parse(raw) };
++  } catch {
++    return emptyState();
++  }
++};
++
++export const writeState = async (
++  shop: string,
++  objectId: string,
++  state: GameModState
++) => {
++  await fs.promises.mkdir(modsStatePath, { recursive: true });
++  const file = path.join(modsStatePath, `${gameKey(shop, objectId)}.json`);
++  const tmp = `${file}.tmp`;
++  await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2));
++  await fs.promises.rename(tmp, file); // atomic replace, no half-written state
++};
++
++const locks = new Map<string, Promise<unknown>>();
++
++/** Serialises operations per game so installs/uninstalls never interleave. */
++export const withGameLock = <T>(
++  shop: string,
++  objectId: string,
++  task: () => Promise<T>
++): Promise<T> => {
++  const key = gameKey(shop, objectId);
++  const run = (locks.get(key) ?? Promise.resolve()).then(task, task);
++  locks.set(
++    key,
++    run.catch(() => {})
++  );
++  return run;
++};
+diff --git a/src/preload/index.ts b/src/preload/index.ts
+index bddc3cd..5929a5c 100644
+--- a/src/preload/index.ts
++++ b/src/preload/index.ts
+@@ -4,6 +4,9 @@ import { contextBridge, ipcRenderer } from "electron";
+ import { randomUUID } from "node:crypto";
+ 
+ import type {
++  ModLoaderId,
++  ModProgressEvent,
++  ModSearchOptions,
+   SystemPowerAction,
+   GameShop,
+   DownloadProgress,
+@@ -1143,6 +1146,57 @@ contextBridge.exposeInMainWorld("electron", {
+     ipcRenderer.invoke("getGameInstallerActionType", shop, objectId),
+   openGameInstallerPath: (shop: GameShop, objectId: string) =>
+     ipcRenderer.invoke("openGameInstallerPath", shop, objectId),
++
++  /* Mods (Thunderstore) */
++  modsGetStatus: (shop: GameShop, objectId: string) =>
++    ipcRenderer.invoke("modsGetStatus", shop, objectId),
++  modsListCommunities: () => ipcRenderer.invoke("modsListCommunities"),
++  modsSetCommunity: (
++    shop: GameShop,
++    objectId: string,
++    community: string,
++    loader?: ModLoaderId
++  ) =>
++    ipcRenderer.invoke("modsSetCommunity", shop, objectId, community, loader),
++  modsSearch: (community: string, options: ModSearchOptions) =>
++    ipcRenderer.invoke("modsSearch", community, options),
++  modsRefreshIndex: (community: string) =>
++    ipcRenderer.invoke("modsRefreshIndex", community),
++  modsInstall: (
++    shop: GameShop,
++    objectId: string,
++    fullName: string,
++    version?: string
++  ) => ipcRenderer.invoke("modsInstall", shop, objectId, fullName, version),
++  modsUninstall: (
++    shop: GameShop,
++    objectId: string,
++    fullName: string,
++    removeOrphans?: boolean
++  ) =>
++    ipcRenderer.invoke(
++      "modsUninstall",
++      shop,
++      objectId,
++      fullName,
++      removeOrphans
++    ),
++  modsSetEnabled: (
++    shop: GameShop,
++    objectId: string,
++    fullName: string,
++    enabled: boolean
++  ) => ipcRenderer.invoke("modsSetEnabled", shop, objectId, fullName, enabled),
++  modsOpenFolder: (shop: GameShop, objectId: string) =>
++    ipcRenderer.invoke("modsOpenFolder", shop, objectId),
++  onModProgress: (cb: (event: ModProgressEvent) => void) => {
++    const listener = (
++      _event: Electron.IpcRendererEvent,
++      payload: ModProgressEvent
++    ) => cb(payload);
++    ipcRenderer.on("on-mod-progress", listener);
++    return () => ipcRenderer.removeListener("on-mod-progress", listener);
++  },
+   openGameWinetricks: (shop: GameShop, objectId: string) =>
+     ipcRenderer.invoke("openGameWinetricks", shop, objectId),
+   openGameExecutablePath: (shop: GameShop, objectId: string) =>
+diff --git a/src/renderer/src/declaration.d.ts b/src/renderer/src/declaration.d.ts
+index 47d34c3..27946ea 100644
+--- a/src/renderer/src/declaration.d.ts
++++ b/src/renderer/src/declaration.d.ts
+@@ -1,5 +1,10 @@
+ import type { AuthPage } from "@shared";
+ import type {
++  ModGameStatus,
++  ModLoaderId,
++  ModProgressEvent,
++  ModSearchOptions,
++  ModSearchResult,
+   SystemPowerAction,
+   AppUpdaterEvent,
+   GameShop,
+@@ -494,6 +499,41 @@ declare global {
+       objectId: string
+     ) => Promise<"install" | "open-folder">;
+     openGameInstallerPath: (shop: GameShop, objectId: string) => Promise<void>;
++    modsGetStatus: (shop: GameShop, objectId: string) => Promise<ModGameStatus>;
++    modsListCommunities: () => Promise<
++      { identifier: string; name: string; packageLoader: string | null }[]
++    >;
++    modsSetCommunity: (
++      shop: GameShop,
++      objectId: string,
++      community: string,
++      loader?: ModLoaderId
++    ) => Promise<void>;
++    modsSearch: (
++      community: string,
++      options: ModSearchOptions
++    ) => Promise<ModSearchResult>;
++    modsRefreshIndex: (community: string) => Promise<void>;
++    modsInstall: (
++      shop: GameShop,
++      objectId: string,
++      fullName: string,
++      version?: string
++    ) => Promise<{ installed: string[]; missing: string[] }>;
++    modsUninstall: (
++      shop: GameShop,
++      objectId: string,
++      fullName: string,
++      removeOrphans?: boolean
++    ) => Promise<{ removed: string[] }>;
++    modsSetEnabled: (
++      shop: GameShop,
++      objectId: string,
++      fullName: string,
++      enabled: boolean
++    ) => Promise<void>;
++    modsOpenFolder: (shop: GameShop, objectId: string) => Promise<void>;
++    onModProgress: (cb: (event: ModProgressEvent) => void) => () => void;
+     openGameWinetricks: (shop: GameShop, objectId: string) => Promise<boolean>;
+     openGameExecutablePath: (shop: GameShop, objectId: string) => Promise<void>;
+     getGameSaveFolder: (
+diff --git a/src/renderer/src/pages/game-details/hero/hero-panel-actions.tsx b/src/renderer/src/pages/game-details/hero/hero-panel-actions.tsx
+index ad1754c..2fb3ee6 100644
+--- a/src/renderer/src/pages/game-details/hero/hero-panel-actions.tsx
++++ b/src/renderer/src/pages/game-details/hero/hero-panel-actions.tsx
+@@ -25,6 +25,7 @@ import {
+   handleClassicsLaunchError,
+ } from "@renderer/helpers";
+ import { DiscSelectionModal } from "../modals/disc-selection-modal";
++import { ModsModal } from "../modals/mods-modal";
+ 
+ import "./hero-panel-actions.scss";
+ import { useEffect } from "react";
+@@ -65,6 +66,7 @@ export function HeroPanelActions() {
+   const navigate = useNavigate();
+ 
+   const [showDiscSelectionModal, setShowDiscSelectionModal] = useState(false);
++  const [showModsModal, setShowModsModal] = useState(false);
+   const [pendingClassicsLaunch, setPendingClassicsLaunch] = useState<{
+     discPath: string | undefined;
+   } | null>(null);
+@@ -430,6 +432,19 @@ export function HeroPanelActions() {
+           {t("options")}
+         </Button>
+ 
++        <Button
++          onClick={() => setShowModsModal(true)}
++          theme="outline"
++          disabled={deleting}
++          className="hero-panel-actions__action"
++        >
++          Mods
++        </Button>
++        <ModsModal
++          visible={showModsModal}
++          onClose={() => setShowModsModal(false)}
++        />
++
+         {game.shop === "launchbox" && (
+           <DiscSelectionModal
+             visible={showDiscSelectionModal}
+diff --git a/src/renderer/src/pages/game-details/modals/mods-modal/index.ts b/src/renderer/src/pages/game-details/modals/mods-modal/index.ts
+new file mode 100644
+index 0000000..fb85ce9
+--- /dev/null
++++ b/src/renderer/src/pages/game-details/modals/mods-modal/index.ts
+@@ -0,0 +1 @@
++export * from "./mods-modal";
+diff --git a/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.scss b/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.scss
+new file mode 100644
+index 0000000..ed16a2e
+--- /dev/null
++++ b/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.scss
+@@ -0,0 +1,105 @@
++@use "../../../../scss/globals.scss";
++
++.mods-modal {
++  display: flex;
++  flex-direction: column;
++  gap: calc(globals.$spacing-unit * 1.5);
++  min-height: 480px;
++  max-height: 70vh;
++
++  &__toolbar {
++    display: flex;
++    gap: globals.$spacing-unit;
++    align-items: center;
++  }
++
++  &__input,
++  &__select {
++    background: globals.$dark-background-color;
++    border: 1px solid globals.$border-color;
++    color: inherit;
++    border-radius: 4px;
++    padding: globals.$spacing-unit;
++  }
++
++  &__input {
++    flex: 1;
++  }
++
++  &__tabs {
++    display: flex;
++    gap: globals.$spacing-unit;
++  }
++
++  &__list {
++    flex: 1;
++    overflow-y: auto;
++    display: flex;
++    flex-direction: column;
++    gap: globals.$spacing-unit;
++  }
++
++  &__item {
++    display: flex;
++    gap: calc(globals.$spacing-unit * 1.5);
++    align-items: center;
++    padding: globals.$spacing-unit;
++    border: 1px solid globals.$border-color;
++    border-radius: 6px;
++    background: globals.$dark-background-color;
++  }
++
++  &__icon {
++    width: 48px;
++    height: 48px;
++    border-radius: 4px;
++    object-fit: cover;
++    flex-shrink: 0;
++  }
++
++  &__info {
++    flex: 1;
++    min-width: 0;
++
++    h4 {
++      margin: 0;
++    }
++  }
++
++  &__meta {
++    color: globals.$muted-color;
++    font-size: 12px;
++  }
++
++  &__desc {
++    color: globals.$muted-color;
++    font-size: 13px;
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++  }
++
++  &__actions {
++    display: flex;
++    gap: globals.$spacing-unit;
++    align-items: center;
++  }
++
++  &__message {
++    color: globals.$muted-color;
++    text-align: center;
++    padding: calc(globals.$spacing-unit * 3);
++  }
++
++  &__error {
++    color: #e5484d;
++    font-size: 13px;
++  }
++
++  &__pager {
++    display: flex;
++    justify-content: center;
++    gap: globals.$spacing-unit;
++    align-items: center;
++  }
++}
+diff --git a/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.tsx b/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.tsx
+new file mode 100644
+index 0000000..c549bd8
+--- /dev/null
++++ b/src/renderer/src/pages/game-details/modals/mods-modal/mods-modal.tsx
+@@ -0,0 +1,366 @@
++import { useCallback, useContext, useEffect, useMemo, useState } from "react";
++import { Button, Modal } from "@renderer/components";
++import { gameDetailsContext } from "@renderer/context";
++import type {
++  ModGameStatus,
++  ModProgressEvent,
++  ModSort,
++  ThunderstorePackage,
++} from "@types";
++import "./mods-modal.scss";
++
++const PAGE_SIZE = 20;
++
++export interface ModsModalProps {
++  visible: boolean;
++  onClose: () => void;
++}
++
++type Community = {
++  identifier: string;
++  name: string;
++  packageLoader: string | null;
++};
++
++const formatCount = (n: number) =>
++  n >= 1_000_000
++    ? `${(n / 1_000_000).toFixed(1)}M`
++    : n >= 1_000
++      ? `${(n / 1_000).toFixed(1)}k`
++      : String(n);
++
++export function ModsModal({ visible, onClose }: Readonly<ModsModalProps>) {
++  const { shop, objectId } = useContext(gameDetailsContext);
++
++  const [status, setStatus] = useState<ModGameStatus | null>(null);
++  const [tab, setTab] = useState<"browse" | "installed">("browse");
++  const [query, setQuery] = useState("");
++  const [sort, setSort] = useState<ModSort>("downloads");
++  const [page, setPage] = useState(0);
++  const [items, setItems] = useState<ThunderstorePackage[]>([]);
++  const [total, setTotal] = useState(0);
++  const [loading, setLoading] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [progress, setProgress] = useState<Record<string, ModProgressEvent>>(
++    {}
++  );
++  const [communities, setCommunities] = useState<Community[]>([]);
++  const [communityFilter, setCommunityFilter] = useState("");
++
++  const refreshStatus = useCallback(async () => {
++    if (!objectId) return;
++    setStatus(await window.electron.modsGetStatus(shop, objectId));
++  }, [shop, objectId]);
++
++  useEffect(() => {
++    if (!visible) return;
++    refreshStatus().catch((e) => setError(String(e?.message ?? e)));
++  }, [visible, refreshStatus]);
++
++  useEffect(() => {
++    if (!visible) return;
++    return window.electron.onModProgress((event) => {
++      setProgress((prev) => ({ ...prev, [event.fullName]: event }));
++      if (event.stage === "done" || event.stage === "error") {
++        if (event.stage === "error")
++          setError(event.message ?? "Install failed");
++        refreshStatus();
++      }
++    });
++  }, [visible, refreshStatus]);
++
++  // Community picker data, only needed when auto-detection found nothing.
++  useEffect(() => {
++    if (!visible || !status || status.community) return;
++    window.electron
++      .modsListCommunities()
++      .then(setCommunities)
++      .catch((e) => setError(String(e?.message ?? e)));
++  }, [visible, status]);
++
++  // Debounced search.
++  useEffect(() => {
++    if (!visible || !status?.community || tab !== "browse") return;
++    let cancelled = false;
++    setLoading(true);
++    setError(null);
++
++    const timer = setTimeout(() => {
++      window.electron
++        .modsSearch(status.community!, {
++          query,
++          sort,
++          page,
++          pageSize: PAGE_SIZE,
++        })
++        .then((result) => {
++          if (cancelled) return;
++          setItems(result.items);
++          setTotal(result.total);
++        })
++        .catch((e) => !cancelled && setError(String(e?.message ?? e)))
++        .finally(() => !cancelled && setLoading(false));
++    }, 250);
++
++    return () => {
++      cancelled = true;
++      clearTimeout(timer);
++    };
++  }, [visible, status?.community, tab, query, sort, page]);
++
++  const installedMap = useMemo(
++    () => new Map((status?.installed ?? []).map((m) => [m.fullName, m])),
++    [status]
++  );
++
++  const run = async (task: () => Promise<unknown>) => {
++    setError(null);
++    try {
++      await task();
++    } catch (e) {
++      setError(e instanceof Error ? e.message : String(e));
++    } finally {
++      refreshStatus();
++    }
++  };
++
++  const install = (fullName: string) =>
++    run(() => window.electron.modsInstall(shop, objectId!, fullName));
++  const uninstall = (fullName: string) =>
++    run(() => window.electron.modsUninstall(shop, objectId!, fullName, true));
++  const toggle = (fullName: string, enabled: boolean) =>
++    run(() =>
++      window.electron.modsSetEnabled(shop, objectId!, fullName, enabled)
++    );
++
++  const pickCommunity = (c: Community) =>
++    run(async () => {
++      await window.electron.modsSetCommunity(shop, objectId!, c.identifier);
++    });
++
++  const renderBody = () => {
++    if (!status) return <p className="mods-modal__message">Loading…</p>;
++
++    if (!status.gameDir) {
++      return (
++        <p className="mods-modal__message">
++          Set this game&apos;s executable in Game Options first so Hydra knows
++          where to install mods.
++        </p>
++      );
++    }
++
++    if (!status.community) {
++      const filtered = communities.filter((c) =>
++        c.name.toLowerCase().includes(communityFilter.toLowerCase())
++      );
++      return (
++        <>
++          <p className="mods-modal__message">
++            Couldn&apos;t match this game to a Thunderstore community
++            automatically. Pick one:
++          </p>
++          <input
++            className="mods-modal__input"
++            placeholder="Filter games…"
++            value={communityFilter}
++            onChange={(e) => setCommunityFilter(e.target.value)}
++          />
++          <div className="mods-modal__list">
++            {filtered.slice(0, 100).map((c) => (
++              <div key={c.identifier} className="mods-modal__item">
++                <div className="mods-modal__info">
++                  <h4>{c.name}</h4>
++                  <span className="mods-modal__meta">{c.identifier}</span>
++                </div>
++                <Button theme="outline" onClick={() => pickCommunity(c)}>
++                  Use
++                </Button>
++              </div>
++            ))}
++          </div>
++        </>
++      );
++    }
++
++    if (!status.loader) {
++      return (
++        <p className="mods-modal__message">
++          This game uses a mod loader that isn&apos;t supported yet (currently
++          BepInEx and MelonLoader are).
++        </p>
++      );
++    }
++
++    return (
++      <>
++        <div className="mods-modal__tabs">
++          <Button
++            theme={tab === "browse" ? "primary" : "outline"}
++            onClick={() => setTab("browse")}
++          >
++            Browse
++          </Button>
++          <Button
++            theme={tab === "installed" ? "primary" : "outline"}
++            onClick={() => setTab("installed")}
++          >
++            Installed ({status.installed.length})
++          </Button>
++        </div>
++
++        {tab === "browse" ? renderBrowse() : renderInstalled()}
++      </>
++    );
++  };
++
++  const renderBrowse = () => (
++    <>
++      <div className="mods-modal__toolbar">
++        <input
++          className="mods-modal__input"
++          placeholder="Search mods…"
++          value={query}
++          onChange={(e) => {
++            setQuery(e.target.value);
++            setPage(0);
++          }}
++        />
++        <select
++          className="mods-modal__select"
++          value={sort}
++          onChange={(e) => {
++            setSort(e.target.value as ModSort);
++            setPage(0);
++          }}
++        >
++          <option value="downloads">Most downloaded</option>
++          <option value="rating">Top rated</option>
++          <option value="updated">Recently updated</option>
++          <option value="name">Name</option>
++        </select>
++      </div>
++
++      <div className="mods-modal__list">
++        {loading && items.length === 0 && (
++          <p className="mods-modal__message">
++            Loading mods (the first load for a game can take a moment)…
++          </p>
++        )}
++        {!loading && items.length === 0 && (
++          <p className="mods-modal__message">No mods found.</p>
++        )}
++        {items.map((pkg) => {
++          const installed = installedMap.get(pkg.fullName);
++          const p = progress[pkg.fullName];
++          const busy = p && p.stage !== "done" && p.stage !== "error";
++          return (
++            <div key={pkg.fullName} className="mods-modal__item">
++              {pkg.icon && (
++                <img
++                  className="mods-modal__icon"
++                  src={pkg.icon}
++                  alt=""
++                  loading="lazy"
++                />
++              )}
++              <div className="mods-modal__info">
++                <h4>{pkg.name.replace(/_/g, " ")}</h4>
++                <div className="mods-modal__meta">
++                  by {pkg.owner} · v{pkg.versions[0].version} ·{" "}
++                  {formatCount(pkg.downloads)} downloads
++                </div>
++                <div className="mods-modal__desc">{pkg.description}</div>
++              </div>
++              <div className="mods-modal__actions">
++                {busy ? (
++                  <span className="mods-modal__meta">
++                    {p.stage} {p.percent}%
++                  </span>
++                ) : installed ? (
++                  <Button
++                    theme="outline"
++                    onClick={() => uninstall(pkg.fullName)}
++                  >
++                    Uninstall
++                  </Button>
++                ) : (
++                  <Button onClick={() => install(pkg.fullName)}>Install</Button>
++                )}
++              </div>
++            </div>
++          );
++        })}
++      </div>
++
++      <div className="mods-modal__pager">
++        <Button
++          theme="outline"
++          disabled={page === 0}
++          onClick={() => setPage(page - 1)}
++        >
++          Prev
++        </Button>
++        <span className="mods-modal__meta">
++          Page {page + 1} of {Math.max(1, Math.ceil(total / PAGE_SIZE))} ·{" "}
++          {total} mods
++        </span>
++        <Button
++          theme="outline"
++          disabled={(page + 1) * PAGE_SIZE >= total}
++          onClick={() => setPage(page + 1)}
++        >
++          Next
++        </Button>
++      </div>
++    </>
++  );
++
++  const renderInstalled = () => (
++    <div className="mods-modal__list">
++      {status!.installed.length === 0 && (
++        <p className="mods-modal__message">No mods installed yet.</p>
++      )}
++      {status!.installed.map((mod) => (
++        <div key={mod.fullName} className="mods-modal__item">
++          <div className="mods-modal__info">
++            <h4>{mod.fullName}</h4>
++            <div className="mods-modal__meta">
++              v{mod.version}
++              {mod.isDependency ? " · dependency" : ""}
++              {mod.enabled ? "" : " · disabled"}
++            </div>
++          </div>
++          <div className="mods-modal__actions">
++            <Button
++              theme="outline"
++              onClick={() => toggle(mod.fullName, !mod.enabled)}
++            >
++              {mod.enabled ? "Disable" : "Enable"}
++            </Button>
++            <Button theme="danger" onClick={() => uninstall(mod.fullName)}>
++              Uninstall
++            </Button>
++          </div>
++        </div>
++      ))}
++    </div>
++  );
++
++  return (
++    <Modal
++      visible={visible}
++      title="Mods"
++      description={
++        status?.community ? `Thunderstore · ${status.community}` : undefined
++      }
++      onClose={onClose}
++      large
++    >
++      <div className="mods-modal">
++        {renderBody()}
++        {error && <div className="mods-modal__error">{error}</div>}
++      </div>
++    </Modal>
++  );
++}
+diff --git a/src/types/index.ts b/src/types/index.ts
+index 130c2af..53ddd82 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -734,3 +734,4 @@ export type ExtractionFailure =
+   | { reason: "unsupported-format"; format: string }
+   | { reason: "file-not-found" };
+ export type { SystemPowerAction } from "./system-power";
++export * from "./mods.types";
+diff --git a/src/types/mods.types.ts b/src/types/mods.types.ts
+new file mode 100644
+index 0000000..ac6b938
+--- /dev/null
++++ b/src/types/mods.types.ts
+@@ -0,0 +1,85 @@
++export type ModLoaderId = "bepinex" | "melonloader";
++
++export interface ThunderstoreVersion {
++  version: string;
++  dependencies: string[];
++  downloadUrl: string;
++  fileSize: number;
++}
++
++export interface ThunderstorePackage {
++  fullName: string; // Owner-Name
++  owner: string;
++  name: string;
++  description: string;
++  icon: string;
++  rating: number;
++  downloads: number;
++  categories: string[];
++  isDeprecated: boolean;
++  isNsfw: boolean;
++  dateUpdated: string;
++  packageUrl: string;
++  versions: ThunderstoreVersion[]; // newest first
++}
++
++export interface ThunderstoreCommunity {
++  identifier: string;
++  name: string;
++}
++
++export type ModSort = "downloads" | "rating" | "updated" | "name";
++
++export interface ModSearchOptions {
++  query?: string;
++  sort?: ModSort;
++  page?: number;
++  pageSize?: number;
++  category?: string;
++  includeDeprecated?: boolean;
++  includeNsfw?: boolean;
++}
++
++export interface ModSearchResult {
++  items: ThunderstorePackage[];
++  total: number;
++  categories: string[];
++}
++
++export interface InstalledMod {
++  fullName: string;
++  version: string;
++  files: string[]; // relative to game dir
++  backups: Record<string, string>; // relative game path -> backup file path
++  enabled: boolean;
++  isDependency: boolean;
++  installedAt: string;
++}
++
++export interface GameModState {
++  community: string | null;
++  loader: ModLoaderId | null;
++  installed: Record<string, InstalledMod>;
++}
++
++export interface ModProgressEvent {
++  shop: string;
++  objectId: string;
++  fullName: string;
++  stage:
++    | "resolving"
++    | "downloading"
++    | "extracting"
++    | "installing"
++    | "done"
++    | "error";
++  percent: number;
++  message?: string;
++}
++
++export interface ModGameStatus {
++  community: string | null;
++  loader: ModLoaderId | null;
++  gameDir: string | null;
++  installed: InstalledMod[];
++}
+-- 
+2.43.0
+

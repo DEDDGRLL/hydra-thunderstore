@@ -53,7 +53,7 @@ const { autoUpdater } = updater;
 autoUpdater.setFeedURL({
   provider: "github",
   owner: "DEDDGRLL",
-  repo: "hydra",
+  repo: "hydra-thunderstore",
 });
 
 autoUpdater.logger = logger;

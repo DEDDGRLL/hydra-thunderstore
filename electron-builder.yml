@@ -113,6 +113,6 @@ npmRebuild: false
 publish:
   provider: github
   owner: DEDDGRLL
-  repo: hydra
+  repo: hydra-thunderstore
 electronDownload:
   mirror: https://npmmirror.com/mirrors/electron/

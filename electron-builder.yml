@@ -1,5 +1,5 @@
-appId: gg.hydralauncher.hydra
-productName: Hydra
+appId: gg.DEDDGRLL.hydra-mods
+productName: Hydra Mods
 beforePack: scripts/legendary-before-pack.cjs
 afterPack: scripts/legendary-after-pack.cjs
 afterSign: scripts/legendary-after-pack.cjs
@@ -112,7 +112,7 @@ appImage:
 npmRebuild: false
 publish:
   provider: github
-  owner: hydralauncher
+  owner: DEDDGRLL
   repo: hydra
 electronDownload:
   mirror: https://npmmirror.com/mirrors/electron/

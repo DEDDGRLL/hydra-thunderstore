@@ -30,7 +30,11 @@ import "./user-preferences";
 import "./library/transfer-game-files";
 import "./emulators";
 import "./retroarch";
+<<<<<<< ours
 import "./epic";
+=======
+import "./mods";
+>>>>>>> theirs
 
 ipcMain.handle("ping", () => "pong");
 ipcMain.handle("getVersion", () => appVersion);
